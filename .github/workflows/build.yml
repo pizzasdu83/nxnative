@@ -1,0 +1,122 @@
+
+name: Build NXNative IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_archive_url:
+        description: 'URL of a ZIP containing the game NSP files'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nxnative-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Metal Toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install dependencies
+        run: |
+          brew install xcodegen zstd glslang
+          brew install --cask dotnet-sdk
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            lz4 \
+            "capstone>=5,<6" \
+            fonttools \
+            nsz \
+            zbic \
+            backports.zstd
+
+      - name: Download game archive
+        env:
+          GAME_ARCHIVE_URL: ${{ inputs.game_archive_url }}
+          GAME_ARCHIVE_TOKEN: ${{ secrets.GAME_ARCHIVE_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/game"
+
+          if [ -n "$GAME_ARCHIVE_TOKEN" ]; then
+            curl -fL --retry 3 \
+              -H "Authorization: Bearer $GAME_ARCHIVE_TOKEN" \
+              "$GAME_ARCHIVE_URL" \
+              -o "$RUNNER_TEMP/game.zip"
+          else
+            curl -fL --retry 3 \
+              "$GAME_ARCHIVE_URL" \
+              -o "$RUNNER_TEMP/game.zip"
+          fi
+
+          ditto -x -k "$RUNNER_TEMP/game.zip" "$RUNNER_TEMP/game"
+
+      - name: Prepare prod.keys
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS_BASE64 }}
+        run: |
+          if [ -z "$PROD_KEYS" ]; then
+            echo "Missing PROD_KEYS_BASE64 secret"
+            exit 1
+          fi
+
+          printf '%s' "$PROD_KEYS" | \
+            base64 -D > "$RUNNER_TEMP/prod.keys"
+
+      - name: Locate game files
+        run: |
+          GAME_DIR="$RUNNER_TEMP/game"
+
+          NSP=$(find "$GAME_DIR" -type f \
+            \( -iname '*.nsp' -o -iname '*.xci' \
+            -o -iname '*.nsz' -o -iname '*.xcz' \) \
+            -print -quit)
+
+          if [ -z "$NSP" ]; then
+            echo "No game files found!"
+            exit 1
+          fi
+
+          GAME_DIR=$(dirname "$NSP")
+          echo "GAME_DIR=$GAME_DIR" >> "$GITHUB_ENV"
+
+      - name: Build IPA
+        run: |
+          python3 scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            -k "$RUNNER_TEMP/prod.keys" \
+            -o "$GITHUB_WORKSPACE/NXNative.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NXNative-IPA
+          path: NXNative.ipa
+          if-no-files-found: error
+          retention-days: 7
